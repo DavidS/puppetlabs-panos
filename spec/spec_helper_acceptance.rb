@@ -1,53 +1,96 @@
-require 'json'
-require 'net/http'
-require 'open3'
+# frozen_string_literal: true
+
+require 'serverspec'
+require 'solid_waffle'
+include SolidWaffle
+
+if ENV['TARGET_HOST'].nil?
+  puts 'Running tests against this machine !'
+else
+  puts "TARGET_HOST #{ENV['TARGET_HOST']}"
+  # load inventory
+  inventory_hash = inventory_hash_from_inventory_file
+  node_config = config_from_node(inventory_hash, ENV['TARGET_HOST'])
+
+  if target_in_group(inventory_hash, ENV['TARGET_HOST'], 'ssh_nodes')
+    set :backend, :ssh
+    options = Net::SSH::Config.for(host)
+    options[:user] = node_config.dig('ssh', 'user') unless node_config.dig('ssh', 'user').nil?
+    options[:port] = node_config.dig('ssh', 'port') unless node_config.dig('ssh', 'port').nil?
+    options[:password] = node_config.dig('ssh', 'password') unless node_config.dig('ssh', 'password').nil?
+    host = if ENV['TARGET_HOST'].include?(':')
+             ENV['TARGET_HOST'].split(':').first
+           else
+             ENV['TARGET_HOST']
+           end
+    set :host,        options[:host_name] || host
+    set :ssh_options, options
+  elsif target_in_group(inventory_hash, ENV['TARGET_HOST'], 'winrm_nodes')
+    require 'winrm'
+
+    set :backend, :winrm
+    set :os, family: 'windows'
+    user = node_config.dig('winrm', 'user') unless node_config.dig('winrm', 'user').nil?
+    pass = node_config.dig('winrm', 'password') unless node_config.dig('winrm', 'password').nil?
+    endpoint = "http://#{ENV['TARGET_HOST']}:5985/wsman"
+
+    opts = {
+      user: user,
+      password: pass,
+      endpoint: endpoint,
+      operation_timeout: 300,
+    }
+
+    winrm = WinRM::Connection.new opts
+    Specinfra.configuration.winrm = winrm
+  end
+end
+
+# require 'json'
+# require 'net/http'
+# require 'open3'
 
 module Helpers
   def debug_output?
     ENV['PANOS_TEST_DEBUG'] == 'true' || ENV['BEAKER_debug'] == 'true'
   end
-end
 
-RSpec.configure do |c|
-  c.include Helpers
-  c.extend Helpers
-
-  c.before :suite do
-    system('rake spec_prep')
-    # system('env|sort')
-    if ENV['PANOS_TEST_HOST']
-      @platform = ENV['PANOS_TEST_PLATFORM']
-      @hostname = ENV['PANOS_TEST_HOST']
+  def self.detect_or_fetch_target
+    if ENV['PANOS_TEST_HOST'] || ENV['TARGET_HOST']
+      platform = ENV['PANOS_TEST_PLATFORM']
+      hostname = ENV['PANOS_TEST_HOST'] || ENV['TARGET_HOST']
     elsif ENV['ABS_RESOURCE_HOSTS']
       puts "Using preconfigured ABS_RESOURCE_HOSTS: #{ENV['ABS_RESOURCE_HOSTS']}"
       hosts = JSON.parse(ENV['ABS_RESOURCE_HOSTS'])
-      @platform = hosts[0]['type']
-      @hostname = hosts[0]['hostname']
-      @destroy = false
+      platform = hosts[0]['type']
+      hostname = hosts[0]['hostname']
+      destroy = false
     elsif ENV['PANOS_TEST_PLATFORM']
       puts "Using VMPooler for PANOS_TEST_PLATFORM: #{ENV['PANOS_TEST_PLATFORM']}"
-      @platform = ENV['PANOS_TEST_PLATFORM']
+      platform = ENV['PANOS_TEST_PLATFORM']
 
       vmpooler = Net::HTTP.start(ENV['VMPOOLER_HOST'] || 'vmpooler.delivery.puppetlabs.net')
 
-      reply = vmpooler.post("/api/v1/vm/#{@platform}", '')
+      reply = vmpooler.post("/api/v1/vm/#{platform}", '')
       raise "Error: #{reply}: #{reply.message}" unless reply.is_a?(Net::HTTPSuccess)
 
       data = JSON.parse(reply.body)
       raise "VMPooler is not ok: #{data.inspect}" unless data['ok'] == true
 
-      @hostname = "#{data[@platform]['hostname']}.#{data['domain']}"
-      puts "reserved #{@hostname} in vmpooler"
-      @destroy = true
+      hostname = "#{data[platform]['hostname']}.#{data['domain']}"
+      puts "reserved #{hostname} in vmpooler"
+      destroy = true
     else
       raise 'Could not locate or create a test host'
     end
 
-    puts "Detected #{@platform} config for #{@hostname}"
+    [platform, hostname, destroy]
+  end
 
+  def self.render_device_conf(hostname)
     File.open('spec/fixtures/acceptance-credentials.conf', 'w') do |file|
       file.puts <<CREDENTIALS
-address: #{@hostname}
+address: #{hostname}
 username: #{ENV['PANOS_TEST_USER'] || 'admin'}
 password: #{ENV['PANOS_TEST_PASSWORD'] || 'admin'}
 CREDENTIALS
@@ -62,16 +105,37 @@ DEVICE
     end
   end
 
-  c.after :suite do
-    next if !@destroy || ENV['BEAKER_destroy'] == 'no' # TODO: handle 'onpass'
+  def self.destroy_target(hostname, destroy = false)
+    return if !destroy || ENV['BEAKER_destroy'] == 'no' # TODO: handle 'onpass'
 
     vmpooler = Net::HTTP.start(ENV['VMPOOLER_HOST'] || 'vmpooler.delivery.puppetlabs.net')
-    reply = vmpooler.delete("/api/v1/vm/#{@hostname}")
+    reply = vmpooler.delete("/api/v1/vm/#{hostname}")
     raise "Error: #{reply}: #{reply.message}" unless reply.is_a?(Net::HTTPSuccess)
 
     data = JSON.parse(reply.body)
     raise "VMPooler is not ok: #{data.inspect}" unless data['ok'] == true
 
-    puts "#{@hostname} scheduled for recycling"
+    puts "#{hostname} scheduled for recycling"
+  end
+end
+
+RSpec.configure do |c|
+  c.include Helpers
+  c.extend Helpers
+end
+
+RSpec.configure do |c|
+  c.before :suite do
+    system('rake spec_prep')
+
+    @platform, @hostname, @destroy = Helpers.detect_or_fetch_target
+
+    puts "Detected #{@platform} config for #{@hostname}"
+
+    Helpers.render_device_conf(@hostname)
+  end
+
+  c.after :suite do
+    Helpers.destroy_target(@hostname, @destroy)
   end
 end

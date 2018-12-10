@@ -1,0 +1,13 @@
+---
+groups:
+- name: ssh_nodes
+  nodes:
+  - name: fczqrl4v8f41ayt.delivery.puppetlabs.net
+    config:
+      transport: ssh
+      ssh:
+        host-key-check: false
+    facts:
+      provisioner: vmpooler
+- name: winrm_nodes
+  nodes: []
