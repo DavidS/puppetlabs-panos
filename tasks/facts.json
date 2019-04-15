@@ -1,0 +1,12 @@
+{
+  "puppet_task_version": 1,
+  "remote": true,
+  "supports_noop": false,
+  "description": "Retrieve facts from a firewall.",
+  "parameters": {},
+  "files": [
+    "panos/lib/puppet/util/task_helper.rb",
+    "panos/lib/puppet/transport/panos.rb",
+    "panos/lib/puppet/transport/schema/panos.rb"
+  ]
+}
